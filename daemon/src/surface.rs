@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     fs,
+    io::ErrorKind,
     ops::Add,
     path::{Path, PathBuf},
     rc::Rc,
@@ -821,17 +822,20 @@ impl Surface {
     /// Add a symlink into .local/state that points to the current wallpaper
     fn update_wallpaper_link(&self, image_path: &Path) {
         let link = self.xdg_state_home.join(self.name());
-        // remove the previous file if it exists, otherwise symlink() fails
-        if link.exists() {
-            if let Err(err) = fs::remove_file(&link)
-                .wrap_err_with(|| format!("Failed to remove symlink {link:?}"))
-            {
-                warn!("{err:?}");
-                // Do no try to create a new symlink
-                return;
-            }
-        }
         if let Err(err) = std::os::unix::fs::symlink(image_path, &link)
+            .or_else(|e| {
+                if e.kind() != ErrorKind::AlreadyExists {
+                    return Err(e.into());
+                }
+
+                // Remove the previous symlink file
+                fs::remove_file(&link)
+                    .wrap_err_with(|| format!("Failed to remove symlink {link:?}"))?;
+
+                // Try to create the symlink again
+                std::os::unix::fs::symlink(image_path, &link)
+                    .wrap_err("Failed to create new symlink after removing old one")
+            })
             .wrap_err_with(|| format!("Failed to create symlink {link:?} to {image_path:?}"))
         {
             warn!("{err:?}");
