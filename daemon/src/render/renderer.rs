@@ -1,86 +1,85 @@
-use std::{cell::RefCell, ffi::CStr, ops::Deref, rc::Rc};
+use std::{ffi::CStr, ops::Deref, rc::Rc};
 
 use color_eyre::{
-    eyre::{bail, ensure, Context},
+    eyre::{ensure, OptionExt, WrapErr},
     Result,
 };
 use egl::API as egl;
 use image::{DynamicImage, RgbaImage};
 use log::error;
+use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform;
 
 use crate::{
     display_info::DisplayInfo,
     gl_check,
     render::{
-        initialize_objects, load_texture,
+        initialize_objects,
         shader::{create_shader, FRAGMENT_SHADER_SOURCE, VERTEX_SHADER_SOURCE},
     },
     wallpaper_info::BackgroundMode,
 };
 
-use super::{
-    coordinates::{get_opengl_point_coordinates, Coordinates},
-    gl,
-    wallpaper::Wallpaper,
-    Transition,
-};
+use super::{gl, wallpaper::Wallpaper, Transition};
 
-fn transparent_image() -> RgbaImage {
-    RgbaImage::from_raw(1, 1, vec![0, 0, 0, 0]).unwrap()
+fn black_image() -> RgbaImage {
+    RgbaImage::from_raw(1, 1, vec![0, 0, 0, 255]).unwrap()
+}
+
+#[derive(Debug)]
+pub enum TransitionStatus {
+    Started,
+    Running { started: u32, progress: f32 },
+    Ended,
 }
 
 pub struct Renderer {
-    gl: gl::Gl,
+    gl: Rc<gl::Gl>,
     pub program: gl::types::GLuint,
-    vao: gl::types::GLuint,
     vbo: gl::types::GLuint,
     eab: gl::types::GLuint,
     // milliseconds time for the transition
-    transition_time: u32,
-    pub time_started: u32,
-    display_info: Rc<RefCell<DisplayInfo>>,
-    old_wallpaper: Wallpaper,
+    pub transition_time: u32,
+    prev_wallpaper: Wallpaper,
     current_wallpaper: Wallpaper,
-    transparent_texture: gl::types::GLuint,
+    //transparent_texture: gl::types::GLuint,
+    /// contains the progress of the current animation
+    transition_status: TransitionStatus,
 }
 
 impl Renderer {
     pub unsafe fn new(
-        image: DynamicImage,
-        display_info: Rc<RefCell<DisplayInfo>>,
         transition_time: u32,
         transition: Transition,
+        display_info: &DisplayInfo,
     ) -> Result<Self> {
-        let gl = gl::Gl::load_with(|name| {
+        let gl = Rc::new(gl::Gl::load_with(|name| {
             egl.get_proc_address(name)
-                .expect("egl.get_proc_address to work") as *const std::ffi::c_void
-        });
+                .ok_or_eyre("Cannot find openGL ES")
+                .unwrap() as *const std::ffi::c_void
+        }));
 
-        let program = create_program(&gl, transition)
-            .context("unable to create program during openGL ES initialization")?;
+        let program =
+            create_program(&gl, transition).wrap_err("Failed to create openGL program")?;
 
-        let (vao, vbo, eab) = initialize_objects(&gl)?;
+        let (vbo, eab) = initialize_objects(&gl).wrap_err("Failed to initialize openGL objects")?;
 
-        let old_wallpaper = Wallpaper::new(display_info.clone());
-        let current_wallpaper = Wallpaper::new(display_info.clone());
+        let current_wallpaper = Wallpaper::new(gl.clone(), black_image().into(), true)?;
+        let prev_wallpaper = Wallpaper::new(gl.clone(), black_image().into(), false)?;
 
-        let transparent_texture = load_texture(&gl, transparent_image().into())?;
-
-        let mut renderer = Self {
+        let renderer = Self {
             gl,
             program,
-            vao,
             vbo,
             eab,
-            time_started: 0,
             transition_time,
-            old_wallpaper,
+            prev_wallpaper,
             current_wallpaper,
-            display_info,
-            transparent_texture,
+            transition_status: TransitionStatus::Ended,
         };
 
-        renderer.load_wallpaper(image, BackgroundMode::Stretch)?;
+        renderer
+            .set_projection_matrix(display_info.transform)
+            .wrap_err("Failed to set projection matrix for openGL context")?;
 
         Ok(renderer)
     }
@@ -93,50 +92,75 @@ impl Renderer {
         Ok(())
     }
 
-    pub unsafe fn draw(&mut self, time: u32, mode: BackgroundMode) -> Result<bool> {
+    pub unsafe fn draw(&mut self) -> Result<()> {
         self.gl.Clear(gl::COLOR_BUFFER_BIT);
-        self.check_error("clearing the screen")?;
-
-        let progress = ((time.saturating_sub(self.time_started)) as f32
-            / self.transition_time as f32)
-            .min(1.0);
-        let transition_going = progress != 1.0;
+        self.check_error("Failed to clear the screen")?;
 
         let loc = self
             .gl
             .GetUniformLocation(self.program, b"progress\0".as_ptr() as *const _);
-        self.check_error("getting the uniform location")?;
-        self.gl.Uniform1f(loc, progress);
-        self.check_error("calling Uniform1i")?;
+        self.check_error("Failed to get the uniform location for progress")?;
+        self.gl.Uniform1f(
+            loc,
+            match self.transition_status {
+                TransitionStatus::Started => 0.0,
+                TransitionStatus::Running {
+                    started: _,
+                    progress,
+                } => progress,
+                TransitionStatus::Ended => 1.0,
+            },
+        );
+        self.check_error("Failed to set the progress in the openGL shader")?;
 
         self.gl
             .DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, std::ptr::null());
-        self.check_error("drawing the triangles")?;
-
-        Ok(transition_going)
-    }
-
-    pub fn load_wallpaper(&mut self, image: DynamicImage, mode: BackgroundMode) -> Result<()> {
-        std::mem::swap(&mut self.old_wallpaper, &mut self.current_wallpaper);
-        self.current_wallpaper.load_image(&self.gl, image)?;
-
-        self.bind_wallpapers(mode)?;
+        self.check_error("Failed to draw the vertices")?;
 
         Ok(())
     }
 
-    fn bind_wallpapers(&mut self, mode: BackgroundMode) -> Result<()> {
-        self.set_mode(mode, false)?;
+    /// Update the transition status with the current time
+    #[inline]
+    pub fn update_transition_status(&mut self, time: u32) -> bool {
+        let started = match self.transition_status {
+            TransitionStatus::Started => time,
+            TransitionStatus::Running {
+                started,
+                progress: _,
+            } => started,
+            TransitionStatus::Ended => return false,
+        };
+        let progress =
+            ((time.saturating_sub(started)) as f32 / self.transition_time as f32).min(1.0);
+        // Recalculate the current progress, the transition might end now
+        if progress == 1.0 {
+            self.transition_finished();
+            false
+        } else {
+            self.transition_status = TransitionStatus::Running { started, progress };
+            true
+        }
+    }
 
+    pub fn load_wallpaper(
+        &mut self,
+        image: DynamicImage,
+        mode: BackgroundMode,
+        offset: Option<f32>,
+        display_info: &DisplayInfo,
+    ) -> Result<()> {
+        std::mem::swap(&mut self.prev_wallpaper, &mut self.current_wallpaper);
         unsafe {
             self.gl.ActiveTexture(gl::TEXTURE0);
-            self.check_error("activating gl::TEXTURE0")?;
-            self.old_wallpaper.bind(&self.gl)?;
-
-            self.gl.ActiveTexture(gl::TEXTURE1);
-            self.check_error("activating gl::TEXTURE1")?;
-            self.current_wallpaper.bind(&self.gl)?;
+            self.check_error("Failed to activate texture TEXTURE0")?;
         }
+        self.prev_wallpaper.bind()?;
+
+        // Load image into TEXTURE1
+        self.current_wallpaper.load_image(image, true)?;
+
+        self.set_mode(mode, offset, display_info)?;
 
         Ok(())
     }
@@ -144,12 +168,12 @@ impl Renderer {
     pub fn set_mode(
         &mut self,
         mode: BackgroundMode,
-        current_vertices_for_fit_mode: bool,
+        offset: Option<f32>,
+        display_info: &DisplayInfo,
     ) -> Result<()> {
-        let display_info = (*self.display_info).borrow();
-        let display_width = display_info.adjusted_width() as f32;
-        let display_height = display_info.adjusted_height() as f32;
-        let display_ratio = display_info.ratio();
+        let display_width = display_info.scaled_width() as f32;
+        let display_height = display_info.scaled_height() as f32;
+        let display_ratio = display_width / display_height;
         let gen_texture_scale = |image_width: f32, image_height: f32| {
             let image_ratio: f32 = image_width / image_height;
             Box::new(match mode {
@@ -158,150 +182,164 @@ impl Renderer {
                     (display_ratio / image_ratio).min(1.0),
                     (image_ratio / display_ratio).min(1.0),
                 ],
-                BackgroundMode::Fit => {
-                    if display_ratio > image_ratio {
-                        [
-                            (display_width / image_width),
-                            (display_height / image_height).max(1.0),
-                        ]
-                    } else {
-                        [
-                            (display_width / image_width).max(1.0),
-                            (display_height / image_height),
-                        ]
-                    }
+                BackgroundMode::Fit | BackgroundMode::FitBorderColor => {
+                    // Portrait mode
+                    // In this case we calculate the width relative to the height of the
+                    // screen with the ratio of the image
+                    let width = display_height * image_ratio;
+                    // Same thing as above, just with the width
+                    let height = display_width / image_ratio;
+                    // Then we calculate the proportions
+                    [
+                        (display_width / width).max(1.0),
+                        (display_height / height).max(1.0),
+                    ]
                 }
                 BackgroundMode::Tile => {
+                    let width_proportion = display_width / image_width * display_ratio;
+                    let height_proportion = display_height / image_height * display_ratio;
                     if display_ratio > image_ratio {
                         // Portrait mode
-                        let height =
-                            (display_height / image_height / (display_height / display_width))
-                                .max(1.0);
-                        if height == 1.0 {
-                            // TODO
-                            [1.0, 1.0]
+                        if height_proportion.max(1.0) == 1.0 {
+                            // Same as Fit
+                            let width = display_height * image_ratio;
+                            [display_width / width, 1.0]
                         } else {
-                            [
-                                (display_width / image_width / (display_height / display_width)),
-                                height,
-                            ]
+                            [width_proportion, height_proportion]
                         }
                     } else {
                         // Landscape mode
-                        [
-                            (display_width / image_width).max(1.0),
-                            (display_height / image_height),
-                        ]
+                        if width_proportion.max(1.0) == 1.0 {
+                            // Same as Fit
+                            let height = display_width / image_ratio;
+                            [1.0, display_height / height]
+                        } else {
+                            [width_proportion, height_proportion]
+                        }
                     }
                 }
             })
         };
         let texture_scale = gen_texture_scale(
-            self.current_wallpaper.image_width as f32,
-            self.current_wallpaper.image_height as f32,
+            self.current_wallpaper.get_image_width() as f32,
+            self.current_wallpaper.get_image_height() as f32,
         );
-        //println!("{texture_scale:?}");
-        let prev_texture_scale = gen_texture_scale(
-            self.old_wallpaper.image_width as f32,
-            self.old_wallpaper.image_height as f32,
+        let (prev_image_width, prev_image_height) = (
+            self.prev_wallpaper.get_image_width() as f32,
+            self.prev_wallpaper.get_image_height() as f32,
         );
 
-        let vertex_data = get_opengl_point_coordinates(
-            Coordinates::default_vec_coordinates(),
-            Coordinates::default_texture_coordinates(),
-        );
+        let prev_texture_scale = gen_texture_scale(prev_image_width, prev_image_height);
 
         unsafe {
-            // Update the vertex buffer
-            self.gl.BufferSubData(
-                gl::ARRAY_BUFFER,
-                0,
-                (vertex_data.len() * std::mem::size_of::<f32>()) as gl::types::GLsizeiptr,
-                vertex_data.as_ptr() as *const _,
-            );
-            self.check_error("buffering the data")?;
-
             let loc = self
                 .gl
                 .GetUniformLocation(self.program, b"textureScale\0".as_ptr() as *const _);
-            self.check_error("getting the uniform location")?;
-            ensure!(loc > 0, "textureScale not found");
+            self.check_error("Failed to get the uniform location for textureScale")?;
+            ensure!(loc > 0, "Failed to find uniform textureScale");
             self.gl
                 .Uniform2fv(loc, 1, texture_scale.as_ptr() as *const _);
-            self.check_error("calling Uniform2fv on textureScale")?;
+            self.check_error("Failed to set uniform textureScale")?;
 
             let loc = self
                 .gl
                 .GetUniformLocation(self.program, b"prevTextureScale\0".as_ptr() as *const _);
-            self.check_error("getting the uniform location")?;
-            ensure!(loc > 0, "prevTextureScale not found");
+            self.check_error("Failed to get the uniform location for prevTextureScale")?;
+            ensure!(loc > 0, "Failed to find the uniform prevTextureScale");
             self.gl
                 .Uniform2fv(loc, 1, prev_texture_scale.as_ptr() as *const _);
-            self.check_error("calling Uniform2fv on prevTextureScale")?;
+            self.check_error("Failed to set the value for prevTextureScale")?;
 
             let loc = self
                 .gl
                 .GetUniformLocation(self.program, b"ratio\0".as_ptr() as *const _);
-            self.check_error("getting the uniform location")?;
+            self.check_error("Failed to get the uniform location for ratio")?;
             self.gl.Uniform1f(loc, display_ratio);
-            self.check_error("calling Uniform1f")?;
+            self.check_error("Failed to set the value for the uniform ratio")?;
+
+            let offset = match (offset, mode) {
+                (
+                    None,
+                    BackgroundMode::Stretch
+                    | BackgroundMode::Center
+                    | BackgroundMode::Fit
+                    | BackgroundMode::FitBorderColor,
+                ) => 0.5,
+                (None, BackgroundMode::Tile) => 0.0,
+                (Some(offset), _) => offset,
+            };
+
+            let loc = self
+                .gl
+                .GetUniformLocation(self.program, b"texture_offset\0".as_ptr() as *const _);
+            self.check_error("Failed to get the location for the uniform texture_offset")?;
+            self.gl.Uniform1f(loc, offset);
+            self.check_error("Failed to set the value for the uniform texture_offset")?;
 
             let texture_wrap = match mode {
                 BackgroundMode::Stretch | BackgroundMode::Center | BackgroundMode::Fit => {
                     gl::CLAMP_TO_BORDER_EXT
                 }
                 BackgroundMode::Tile => gl::REPEAT,
+                BackgroundMode::FitBorderColor => gl::CLAMP_TO_EDGE,
             } as i32;
 
             self.gl.ActiveTexture(gl::TEXTURE0);
-            self.check_error("activating gl::TEXTURE0")?;
+            self.check_error("Failed to activate texture TEXTURE0")?;
             self.gl
                 .TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, texture_wrap);
-            self.check_error("defining the texture wrap_s")?;
+            self.check_error("Failed to set the attribute TEXTURE_WRAP_S for TEXTURE0")?;
             self.gl
                 .TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, texture_wrap);
-            self.check_error("defining the texture wrap_t")?;
+            self.check_error("Failed to set the attribute TEXTURE_WRAP_T FOR TEXTURE0")?;
 
             self.gl.ActiveTexture(gl::TEXTURE1);
-            self.check_error("activating gl::TEXTURE1")?;
+            self.check_error("Failed to activate texture TEXTURE1")?;
             self.gl
                 .TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, texture_wrap);
-            self.check_error("defining the texture wrap_s")?;
+            self.check_error("Failed to set the attribute TEXTURE_WRAP_S for TEXTURE1")?;
             self.gl
                 .TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, texture_wrap);
-            self.check_error("defining the texture wrap_t")?;
+            self.check_error("Failed to set the attribute TEXTURE_WRAP_T for TEXTURE1")?;
         }
 
         Ok(())
     }
 
     #[inline]
-    pub fn start_transition(&mut self, time: u32, new_transition_time: u32) {
-        self.time_started = time;
-        self.transition_time = new_transition_time;
+    pub fn start_transition(&mut self, transition_time: u32) {
+        match self.transition_status {
+            TransitionStatus::Started | TransitionStatus::Running { .. } => unreachable!(),
+            TransitionStatus::Ended => self.transition_status = TransitionStatus::Started,
+        }
+        // Needed to skip the initial transition depending on the configuration
+        self.transition_time = transition_time;
     }
 
     #[inline]
     pub fn clear_after_draw(&self) -> Result<()> {
         unsafe {
             // Unbind the framebuffer and renderbuffer before deleting.
-            self.gl.BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
-            self.check_error("unbinding the unpack buffer")?;
-            self.gl.BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
-            self.check_error("unbinding the framebuffer")?;
+            // self.gl.BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
+            // self.check_error("unbinding the unpack buffer")?;
+            self.gl.BindFramebuffer(gl::FRAMEBUFFER, 0);
+            self.check_error("Failed to unbind the framebuffer")?;
             self.gl.BindRenderbuffer(gl::RENDERBUFFER, 0);
-            self.check_error("unbinding the render buffer")?;
+            self.check_error("Failed to unbind the renderbuffer")?;
         }
 
         Ok(())
     }
 
-    pub fn resize(&mut self) -> Result<()> {
-        let info = (*self.display_info).borrow();
+    pub fn resize(&mut self, display_info: &DisplayInfo) -> Result<()> {
         unsafe {
-            self.gl
-                .Viewport(0, 0, info.adjusted_width(), info.adjusted_height());
-            self.check_error("resizing the viewport")
+            self.gl.Viewport(
+                0,
+                0,
+                display_info.adjusted_width(),
+                display_info.adjusted_height(),
+            );
+            self.check_error("Failed to resize the openGL viewport")
         }
     }
 
@@ -312,82 +350,160 @@ impl Renderer {
 
     #[inline]
     pub fn transition_finished(&mut self) {
-        // By loading a transparent pixel into the old wallpaper, we free space from GPU memory
-        if let Err(err) = self
-            .old_wallpaper
-            .load_image(&self.gl, transparent_image().into())
-            .context("unloading the previous wallpaper")
-        {
-            error!("{err:?}");
-        }
+        self.transition_status = TransitionStatus::Ended;
     }
 
     #[inline]
-    pub fn update_transition(&mut self, transition: Transition) {
+    pub fn update_transition(&mut self, transition: Transition, transform: Transform) {
         match create_program(&self.gl, transition) {
             Ok(program) => {
                 unsafe {
                     self.gl.DeleteProgram(self.program);
                 }
+                // Stop the transition immediately
+                if self.transition_running() {
+                    self.transition_finished();
+                }
                 self.program = program;
+                unsafe {
+                    if let Err(err) = self
+                        .set_projection_matrix(transform)
+                        .wrap_err("Failed to set the projection matrix")
+                    {
+                        error!("{err:?}");
+                    }
+                }
             }
             Err(err) => error!("{err:?}"),
         }
+    }
+
+    #[inline]
+    pub fn transition_running(&self) -> bool {
+        match self.transition_status {
+            TransitionStatus::Started | TransitionStatus::Running { .. } => true,
+            TransitionStatus::Ended => false,
+        }
+    }
+
+    pub unsafe fn set_projection_matrix(&self, transform: Transform) -> Result<()> {
+        let projection_matrix = projection_matrix(transform);
+        let loc = self
+            .gl
+            .GetUniformLocation(self.program, b"projection_matrix\0".as_ptr() as *const _);
+        self.check_error("Failed to get the uniform location for projection_matrix")?;
+        ensure!(loc > 0, "Failed to find uniform projection_matrix");
+        self.gl
+            .UniformMatrix2fv(loc, 1, 0, projection_matrix.as_ptr());
+        //self.gl
+        //    .UniformMatrix2fv(loc, 1, 0, [1.0, 0.0, 0.0, 1.0].as_ptr());
+
+        self.check_error("calling Uniform1i")?;
+
+        Ok(())
     }
 }
 
 fn create_program(gl: &gl::Gl, transition: Transition) -> Result<gl::types::GLuint> {
     unsafe {
         let program = gl.CreateProgram();
-        gl_check!(gl, "calling CreateProgram");
+        gl_check!(gl, "Failed to create openGL program");
 
         let vertex_shader = create_shader(gl, gl::VERTEX_SHADER, &[VERTEX_SHADER_SOURCE.as_ptr()])
-            .expect("vertex shader creation succeed");
+            .expect("Failed to create vertices shader");
         let (uniform_callback, shader) = transition.clone().shader();
         let fragment_shader = create_shader(
             gl,
             gl::FRAGMENT_SHADER,
             &[FRAGMENT_SHADER_SOURCE.as_ptr(), shader.as_ptr()],
         )
-        .with_context(|| {
-            format!("unable to create fragment_shader with transisition {transition:?}")
+        .wrap_err_with(|| {
+            format!("Failed to create fragment shader for transisition {transition:?}")
         })?;
 
         gl.AttachShader(program, vertex_shader);
-        gl_check!(gl, "attach vertex shader");
+        gl_check!(gl, "Failed to attach vertices shader");
         gl.AttachShader(program, fragment_shader);
-        gl_check!(gl, "attach fragment shader");
+        gl_check!(gl, "Failed to attach fragment shader");
         gl.LinkProgram(program);
-        gl_check!(gl, "linking the program");
-        {
-            // This shouldn't be needed, gl_check already checks the status of LinkProgram
-            let mut status: i32 = 0;
-            gl.GetProgramiv(program, gl::LINK_STATUS, &mut status as *mut _);
-            ensure!(status == 1, "Program was not linked correctly");
-        }
-        gl_check!(gl, "calling UseProgram");
+        gl_check!(gl, "Failed to link the openGL program");
         gl.DeleteShader(vertex_shader);
-        gl_check!(gl, "deleting the vertex shader");
+        gl_check!(gl, "Failed to delete the vertices shader");
         gl.DeleteShader(fragment_shader);
-        gl_check!(gl, "deleting the fragment shader");
+        gl_check!(gl, "Failed to delete the fragment shader");
         gl.UseProgram(program);
-        gl_check!(gl, "calling UseProgram");
+        gl_check!(gl, "Failed to switch to the newly created openGL program");
 
         // We need to setup the uniform each time we create a program
         let loc = gl.GetUniformLocation(program, b"u_prev_texture\0".as_ptr() as *const _);
-        gl_check!(gl, "getting the uniform location for u_prev_texture");
-        ensure!(loc > 0, "u_prev_texture not found");
+        gl_check!(gl, "Failed to get the uniform location for u_prev_texture");
+        ensure!(loc > 0, "Failed to find the uniform u_prev_texture");
         gl.Uniform1i(loc, 0);
-        gl_check!(gl, "calling Uniform1i");
+        gl_check!(gl, "Failed to set the value for uniform u_prev_texture");
         let loc = gl.GetUniformLocation(program, b"u_texture\0".as_ptr() as *const _);
-        gl_check!(gl, "getting the uniform location for u_texture");
-        ensure!(loc > 0, "u_texture not found");
+        gl_check!(gl, "Failed to get the uniform location for u_texture");
+        ensure!(loc > 0, "Failed to find the uniform u_texture");
         gl.Uniform1i(loc, 1);
-        gl_check!(gl, "calling Uniform1i");
+        gl_check!(gl, "Failed to set the value for uniform u_texture");
 
         uniform_callback(gl, program)?;
 
         Ok(program)
+    }
+}
+
+#[rustfmt::skip]
+fn projection_matrix(transform: Transform) -> [f32; 4] {
+    match transform {
+        Transform::Normal => {
+            [
+                1.0, 0.0,
+                0.0, 1.0,
+            ]
+        }
+        Transform::_90 => {
+            [
+                0.0, -1.0,
+                1.0, 0.0,
+            ]
+        }
+        Transform::_180 => {
+            [
+                -1.0, 0.0,
+                0.0, -1.0,
+            ]
+        }
+        Transform::_270 => {
+            [
+                0.0, 1.0,
+                -1.0, 0.0,
+            ]
+        }
+        Transform::Flipped => {
+            [
+                -1.0, 0.0,
+                0.0, 1.0,
+            ]
+        }
+        Transform::Flipped90 => {
+            [
+                0.0, -1.0,
+                -1.0, 0.0,
+            ]
+        }
+        Transform::Flipped180 => {
+            [
+                1.0, 0.0,
+                0.0, -1.0,
+            ]
+        }
+        Transform::Flipped270 => {
+            [
+                0.0, 1.0,
+                1.0, 0.0,
+            ]
+        }
+        _ => unreachable!()
     }
 }
 
@@ -402,11 +518,8 @@ impl Deref for Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
-            self.gl.DeleteTextures(1, &self.current_wallpaper.texture);
-            self.gl.DeleteTextures(1, &self.old_wallpaper.texture);
             self.gl.DeleteBuffers(1, &self.eab);
             self.gl.DeleteBuffers(1, &self.vbo);
-            self.gl.DeleteBuffers(1, &self.vao);
             self.gl.DeleteProgram(self.program);
         }
     }

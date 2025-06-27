@@ -10,7 +10,7 @@ use std::{
 };
 
 use color_eyre::{
-    eyre::{anyhow, ensure, Context},
+    eyre::{ensure, eyre, WrapErr},
     owo_colors::OwoColorize,
     Result, Section,
 };
@@ -23,10 +23,13 @@ use smithay_client_toolkit::reexports::calloop::ping::Ping;
 use crate::{
     image_picker::ImagePicker,
     render::Transition,
-    wallpaper_info::{BackgroundMode, Sorting, WallpaperInfo},
+    wallpaper_info::{BackgroundMode, Recursive, Sorting, WallpaperInfo},
 };
 
+use std::os::unix::fs::PermissionsExt;
+
 #[derive(Default, Deserialize, PartialEq, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SerializedWallpaperInfo {
     #[serde(default, deserialize_with = "tilde_expansion_deserialize")]
     pub path: Option<PathBuf>,
@@ -36,7 +39,9 @@ pub struct SerializedWallpaperInfo {
     pub apply_shadow: Option<bool>,
     pub sorting: Option<Sorting>,
     pub mode: Option<BackgroundMode>,
+    #[serde(rename = "queue-size")]
     pub queue_size: Option<usize>,
+    #[serde(rename = "transition-time")]
     pub transition_time: Option<u32>,
 
     /// Determines if we should show the transition between black and first
@@ -44,9 +49,26 @@ pub struct SerializedWallpaperInfo {
     /// `Some(true)` means we fade from black to the first wallpaper.
     ///
     /// See [crate::wallpaper_info::WallpaperInfo]
+    #[serde(rename = "initial-transition")]
     pub initial_transition: Option<bool>,
-    #[serde(flatten)]
     pub transition: Option<Transition>,
+
+    /// Determine the offset for the wallpaper to be drawn into the screen
+    /// Must be from 0.0 to 1.0, by default is 0.0 in tile mode and 0.5 in all the others
+    ///
+    /// See [crate::wallpaper_info::WallpaperInfo]
+    pub offset: Option<f32>,
+
+    /// Assign these displays to a group that shows the same wallpaper
+    pub group: Option<u8>,
+
+    /// Recursively traverse the directory set as path
+    /// Set as true by default
+    pub recursive: Option<bool>,
+
+    // Path to bash script.
+    #[serde(default, deserialize_with = "tilde_expansion_deserialize")]
+    pub exec: Option<PathBuf>,
 }
 
 impl SerializedWallpaperInfo {
@@ -59,13 +81,13 @@ impl SerializedWallpaperInfo {
                 path
             }
             (None, None) => {
-                return Err(anyhow!(
-                    "attribute {} is not set",
+                return Err(eyre!(
+                    "Attribute {} must be set",
                     "path".bold().italic().blue(),
                 ))
                 .with_suggestion(|| {
                     format!(
-                        "add attribute {} in the display section of the configuration:\npath = \"</path/to/image>\"",
+                        "Add attribute {} in the display section of the configuration:\npath = \"</path/to/image>\"",
                         "path".bold().italic().blue(),
                     )
                 });
@@ -74,8 +96,8 @@ impl SerializedWallpaperInfo {
         .to_path_buf();
         // Ensure that a path exists
         if !path.exists() {
-            return Err(anyhow!(
-                "path {} for attribute {}{} does not exist",
+            return Err(eyre!(
+                "Path {} for attribute {}{} must exist",
                 path.to_string_lossy().italic().yellow(),
                 "path".bold().italic().blue(),
                 if path_inherited {
@@ -89,7 +111,7 @@ impl SerializedWallpaperInfo {
             ))
             .with_suggestion(|| {
                 format!(
-                    "set attribute {} to an existing file or directory",
+                    "Set attribute {} to an existing file or directory",
                     "path".bold().italic().blue(),
                 )
             });
@@ -105,10 +127,10 @@ impl SerializedWallpaperInfo {
         // duration can only be set when path is a directory
         if duration.is_some() && !path.is_dir() {
             // Do no use bail! to add suggestion
-            return Err(anyhow!(
-                "Attribute {} is set to a file and attribute {} is also set.",
+            return Err(eyre!(
+                "{} cannot be set when {} points to a file",
+                "duration".bold().italic().blue(),
                 "path".bold().italic().blue(),
-                "duration".bold().italic().blue()
             )
             .with_suggestion(|| {
                 format!(
@@ -120,9 +142,68 @@ impl SerializedWallpaperInfo {
         }
 
         let sorting = match (&self.sorting, &default.sorting) {
-            (Some(sorting), _) | (None, Some(sorting)) => *sorting,
-            (None, None) => Sorting::default(),
+            (None, Some(_)) if path.is_file() && !path_inherited => None,
+            (Some(sorting), _) | (None, Some(sorting)) => Some(*sorting),
+            (None, None) => None,
         };
+
+        let group = match (&self.group, &default.group) {
+            (None, Some(_)) if path.is_file() && !path_inherited => None,
+            (Some(sorting), _) | (None, Some(sorting)) => Some(*sorting),
+            (None, None) => None,
+        };
+
+        // sorting and group can only be set when path is a directory
+        if (sorting.is_some() || group.is_some()) && !path.is_dir() {
+            // Do no use bail! to add suggestion
+            return Err(eyre!(
+                "{} cannot be set when {} is a directory",
+                if sorting.is_some() {
+                    "sorting"
+                } else {
+                    "group"
+                }
+                .bold()
+                .italic()
+                .blue(),
+                "path".bold().italic().blue(),
+            )
+            .with_suggestion(|| {
+                format!(
+                    "Either remove {} or set {} to a directory",
+                    if sorting.is_some() {
+                        "sorting"
+                    } else {
+                        "group"
+                    }
+                    .bold()
+                    .italic()
+                    .blue(),
+                    "path".bold().italic().blue(),
+                )
+            }));
+        }
+
+        // If there is no sorting but the group is set
+        let sorting = if group.is_some() && sorting.is_none() {
+            // Assign it the default one, so that we can do the group match below
+            Some(Sorting::default())
+        } else {
+            sorting
+        };
+        let sorting = sorting.map(|sorting| {
+            if let Some(group) = group {
+                match sorting {
+                    Sorting::Random => Sorting::GroupedRandom { group },
+                    Sorting::Ascending => todo!(),
+                    Sorting::Descending => todo!(),
+                    Sorting::GroupedRandom { group: _ } => unreachable!(),
+                }
+            } else {
+                sorting
+            }
+        });
+
         let mode = match (&self.mode, &default.mode) {
             (Some(mode), _) | (None, Some(mode)) => *mode,
             (None, None) => BackgroundMode::default(),
@@ -133,7 +214,7 @@ impl SerializedWallpaperInfo {
         };
         let initial_transition = match (&self.initial_transition, &default.initial_transition) {
             (Some(initial_transition), _) | (None, Some(initial_transition)) => *initial_transition,
-            (None, None) => true,
+            (None, None) => false,
         };
 
         let transition = match (&self.transition, &default.transition) {
@@ -146,6 +227,41 @@ impl SerializedWallpaperInfo {
             (None, None) => transition.default_transition_time(),
         };
 
+        let offset = match (&self.offset, &default.offset) {
+            (Some(offset), _) | (None, Some(offset)) => Some(*offset),
+            (None, None) => None,
+        };
+
+        let recursive = match (&self.recursive, &default.recursive) {
+            (Some(recursive), _) | (None, Some(recursive)) => {
+                Some(std::convert::Into::<Recursive>::into(*recursive))
+            }
+            (None, None) => None,
+        };
+
+        let exec = match (&self.exec, &default.exec) {
+            (Some(exec), _) | (None, Some(exec)) => Some(exec.to_path_buf()),
+            (None, None) => None,
+        };
+
+        if let Some(exec_path) = &exec {
+            ensure!(
+                exec_path.exists(),
+                "Exec script {} must exist",
+                exec_path.to_string_lossy().italic().yellow()
+            );
+            ensure!(
+                exec_path.is_file(),
+                "Exec path {} must be a file",
+                exec_path.to_string_lossy().italic().yellow()
+            );
+            ensure!(
+                std::fs::metadata(exec_path)?.permissions().mode() & 0o111 != 0,
+                "Exec script {} must be executable",
+                exec_path.to_string_lossy().italic().yellow()
+            );
+        }
+
         Ok(WallpaperInfo {
             path,
             duration,
@@ -156,6 +272,9 @@ impl SerializedWallpaperInfo {
             transition_time,
             initial_transition,
             transition,
+            offset,
+            recursive,
+            exec,
         })
     }
 }
@@ -176,7 +295,7 @@ pub struct Config {
 
 impl Config {
     pub fn new_from_path(path: &Path) -> Result<Self> {
-        ensure!(path.exists(), "File {path:?} does not exists");
+        ensure!(path.exists(), "File {path:?} does not exist");
         let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
         config
             .data
@@ -194,10 +313,12 @@ impl Config {
             if info == &config.default {
                 true
             } else {
-                match info
-                    .apply_and_validate(&config.default)
-                    .with_context(|| format!("while validating display {}", name.bold().magenta()))
-                {
+                match info.apply_and_validate(&config.default).wrap_err_with(|| {
+                    format!(
+                        "Failed to validate configuration for display {}",
+                        name.bold().magenta()
+                    )
+                }) {
                     Ok(_) => true,
                     Err(err) => {
                         // We do not want to exit when error occurs, print it and go forward
@@ -208,15 +329,91 @@ impl Config {
             }
         });
 
+        let groups = config
+            .data
+            .iter()
+            .filter_map(|(name, info)| {
+                // It's a bit overkill to call this function again, but the displays are on average 1 or 2
+                // and the code is simple enough that it wouldn't make a difference with 10 either
+                info.apply_and_validate(&config.default)
+                    .map(|res| (name, res))
+                    .ok()
+            })
+            .filter(|(_, info)| {
+                info.sorting.is_some()
+                    && matches!(info.sorting.unwrap(), Sorting::GroupedRandom { .. })
+            })
+            .collect::<Vec<_>>();
+
+        // Check if all the groups share the same path
+        // This check is only useful when there is more than one display
+        // We display a warning related to the config issue, but we are not fixing anything here
+        // The path that will be used is probably not what the user expect, but proving an "expected"
+        // behaviour for a configuration issue seems overkill
+        if groups.len() > 1 {
+            // We want to skip displays for which we already displayed the warning
+            let mut errored_list = Vec::new();
+            for i in 0..groups.len() {
+                let x = groups.get(i).unwrap();
+                for j in 1..groups.len() {
+                    if errored_list.contains(&j) {
+                        continue;
+                    }
+                    let y = groups.get(j).unwrap();
+                    if !(x.1.sorting.is_none()
+                        || x.1.sorting != y.1.sorting
+                        || x.1.path == y.1.path)
+                    {
+                        warn!(
+                            "Displays {} and {} are assigned to group {} but have different paths",
+                            x.0,
+                            y.0,
+                            match x.1.sorting.unwrap() {
+                                Sorting::GroupedRandom { group } => group,
+                                _ => unreachable!(),
+                            }
+                        );
+                        errored_list.push(j);
+                    }
+                }
+            }
+        }
+
         config.path = path.to_path_buf();
         Ok(config)
     }
 
-    pub fn get_output_by_name(&self, name: &str) -> Result<WallpaperInfo> {
-        self.data
-            .get(name)
-            .unwrap_or(&self.any)
-            .apply_and_validate(&self.default)
+    pub fn get_info_for_output(&self, name: &str, description: &str) -> Result<WallpaperInfo> {
+        use regex::Regex;
+        // Actually, wayland may report an output description in different
+        // formats as the compositors wants to. For example, niri reports
+        // description in format `<vendor name> - <monitor name> - <port name>`
+        // so, we can not handle here the all formats at once. But users
+        // can use a regex to match theirs' compositors outputs.
+        let mut matched = None;
+        for (k, v) in self.data.iter() {
+            if !k.starts_with("re:") {
+                continue;
+            }
+            // TODO(Shvedov): Better to compile re withing creation of
+            // WallpaperInfo, but adding field of type `Option<Regex>` breaks
+            // PatialEq macro.
+            let re = Regex::new(&k[3..]).unwrap();
+            if re.is_match(description) {
+                matched = Some(v);
+                break;
+            };
+        }
+
+        if let Some(info) = matched {
+            info.apply_and_validate(&self.default)
+        } else {
+            self.data
+                .get(clean_monitor_description(description))
+                .or_else(|| self.data.get(name))
+                .unwrap_or(&self.any)
+                .apply_and_validate(&self.default)
+        }
     }
 
     pub fn listen_to_changes(&self, hotwatch: &mut Hotwatch, ping: Ping) -> Result<()> {
@@ -228,15 +425,22 @@ impl Config {
                     ping.ping();
                 }
             })
-            .with_context(|| format!("watching file {:?}", &self.path))?;
+            .wrap_err_with(|| format!("Failed to watch file changes for {:?}", &self.path))?;
         Ok(())
     }
 
-    pub fn paths(&self) -> Vec<PathBuf> {
+    pub fn paths(&self) -> Vec<(PathBuf, Recursive)> {
         let mut paths: Vec<_> = self
             .data
             .values()
-            .filter_map(|info| info.path.as_ref().map(|p| p.to_path_buf()))
+            .filter_map(|info| {
+                info.path.as_ref().map(|p| {
+                    (
+                        p.to_path_buf(),
+                        info.recursive.map(Recursive::from).unwrap_or_default(),
+                    )
+                })
+            })
             .collect();
         paths.sort_unstable();
         paths.dedup();
@@ -246,9 +450,9 @@ impl Config {
     /// Return true if the struct changed
     pub fn update(&mut self) -> bool {
         // When the config file has been written into
-        let new_config = Config::new_from_path(&self.path).with_context(|| {
+        let new_config = Config::new_from_path(&self.path).wrap_err_with(|| {
             format!(
-                "updating configuration from file {}",
+                "Failed to read the new configuration from {}",
                 self.path.to_string_lossy()
             )
         });
@@ -288,4 +492,48 @@ where
         path.strip_prefix("~")
             .map_or(path.to_path_buf(), |p| home_dir().unwrap().join(p)),
     ))
+}
+
+/// Clean a monitor description so that the value reported by Wayland matches the one reported by
+/// Sway/Hyprland.
+///
+/// Wayland may report an output description that includes information about the port and port type.
+/// This information is *not* reported by Sway or Hyprland so we need to strip it off so outputs are
+/// matched the way users expect.
+fn clean_monitor_description(desc: &str) -> &str {
+    desc.split_once(" (")
+        .map(|(s, _)| s)
+        .unwrap_or(desc)
+        // Some monitors descriptions contain more than a single space before the port information.
+        // See <https://github.com/danyspin97/wpaperd/issues/113>.
+        .trim_end()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_clean_monitor_description() {
+        assert_eq!(
+            clean_monitor_description("Microstep MPG321UX OLED 0x01010101"),
+            "Microstep MPG321UX OLED 0x01010101"
+        );
+        assert_eq!(
+            clean_monitor_description("Ancor Communications Inc ASUS PB258 GBLMTJ022271 (DP-9)"),
+            "Ancor Communications Inc ASUS PB258 GBLMTJ022271"
+        );
+        assert_eq!(
+            clean_monitor_description("Ancor Communications Inc ASUS PB258 G1LMTJ002598 (DP-10)"),
+            "Ancor Communications Inc ASUS PB258 G1LMTJ002598"
+        );
+        assert_eq!(
+            clean_monitor_description("BOE 0x095F  (eDP-1)"),
+            "BOE 0x095F"
+        );
+        assert_eq!(
+            clean_monitor_description("GIGA-BYTE TECHNOLOGY CO. LTD. G34WQC A  (DP-8)"),
+            "GIGA-BYTE TECHNOLOGY CO. LTD. G34WQC A"
+        );
+    }
 }

@@ -4,12 +4,29 @@ use serde::Deserialize;
 
 use crate::{image_picker::ImagePicker, render::Transition};
 
+#[derive(Debug, PartialEq, Default, Ord, Eq, PartialOrd, Clone, Copy)]
+pub enum Recursive {
+    #[default]
+    On,
+    Off,
+}
+
+impl From<bool> for Recursive {
+    fn from(b: bool) -> Self {
+        if b {
+            Recursive::On
+        } else {
+            Recursive::Off
+        }
+    }
+}
+
 #[derive(PartialEq, Debug)]
 pub struct WallpaperInfo {
     pub path: PathBuf,
     pub duration: Option<Duration>,
     pub apply_shadow: bool,
-    pub sorting: Sorting,
+    pub sorting: Option<Sorting>,
     pub mode: BackgroundMode,
     pub drawn_images_queue_size: usize,
     pub transition_time: u32,
@@ -19,6 +36,14 @@ pub struct WallpaperInfo {
     /// `true` means we fade from black to the first wallpaper.
     pub initial_transition: bool,
     pub transition: Transition,
+
+    /// Determine the offset for the wallpaper to be drawn into the screen
+    /// Must be from 0.0 to 1.0, by default is 0.0 in tile mode and 0.5 in all the others
+    pub offset: Option<f32>,
+
+    /// Recursively iterate the directory set as path
+    pub recursive: Option<Recursive>,
+    pub exec: Option<PathBuf>,
 }
 
 impl Default for WallpaperInfo {
@@ -27,31 +52,39 @@ impl Default for WallpaperInfo {
             path: PathBuf::new(),
             duration: None,
             apply_shadow: false,
-            sorting: Sorting::default(),
+            sorting: None,
             mode: BackgroundMode::default(),
             drawn_images_queue_size: ImagePicker::DEFAULT_DRAWN_IMAGES_QUEUE_SIZE,
             transition_time: Transition::Fade {}.default_transition_time(),
             initial_transition: true,
             transition: Transition::Fade {},
+            offset: None,
+            recursive: None,
+            exec: None,
         }
     }
 }
 
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Sorting {
     #[default]
     Random,
+    #[serde(skip)]
+    GroupedRandom {
+        group: u8,
+    },
     Ascending,
     Descending,
 }
 
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum BackgroundMode {
     Stretch,
     #[default]
     Center,
     Fit,
     Tile,
+    FitBorderColor,
 }

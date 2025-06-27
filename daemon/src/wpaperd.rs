@@ -1,8 +1,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use color_eyre::eyre::eyre;
 use color_eyre::owo_colors::OwoColorize;
-use color_eyre::Result;
+use color_eyre::{eyre::WrapErr, Result};
 use log::{error, warn};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -19,12 +20,14 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
     registry_handlers,
 };
+use xdg::BaseDirectories;
 
 use crate::config::Config;
 use crate::display_info::DisplayInfo;
 use crate::filelist_cache::FilelistCache;
 use crate::image_loader::ImageLoader;
 use crate::surface::Surface;
+use crate::wallpaper_groups::WallpaperGroups;
 use crate::wallpaper_info::WallpaperInfo;
 
 pub struct Wpaperd {
@@ -35,9 +38,11 @@ pub struct Wpaperd {
     pub registry_state: RegistryState,
     pub surfaces: Vec<Surface>,
     pub config: Config,
-    egl_display: egl::Display,
+    pub egl_display: egl::Display,
     pub filelist_cache: Rc<RefCell<FilelistCache>>,
-    image_loader: Rc<RefCell<ImageLoader>>,
+    pub image_loader: Rc<RefCell<ImageLoader>>,
+    pub wallpaper_groups: Rc<RefCell<WallpaperGroups>>,
+    pub xdg_dirs: BaseDirectories,
 }
 
 impl Wpaperd {
@@ -47,31 +52,42 @@ impl Wpaperd {
         config: Config,
         egl_display: egl::Display,
         filelist_cache: Rc<RefCell<FilelistCache>>,
+        image_loader: Rc<RefCell<ImageLoader>>,
+        xdg_dirs: BaseDirectories,
     ) -> Result<Self> {
-        let shm_state = Shm::bind(globals, qh)?;
-
-        let image_loader = Rc::new(RefCell::new(ImageLoader::new()));
+        let shm_state = Shm::bind(globals, qh).wrap_err("Failed to bind memory state")?;
 
         Ok(Self {
-            compositor_state: CompositorState::bind(globals, qh)?,
+            compositor_state: CompositorState::bind(globals, qh)
+                .wrap_err("Failed to bind compositor state")?,
             output_state: OutputState::new(globals, qh),
             shm_state,
-            layer_state: LayerShell::bind(globals, qh)?,
+            layer_state: LayerShell::bind(globals, qh)
+                .wrap_err("Failed to bind layershell state")?,
             registry_state: RegistryState::new(globals),
             surfaces: Vec::new(),
             config,
             egl_display,
             filelist_cache,
             image_loader,
+            wallpaper_groups: Rc::new(RefCell::new(WallpaperGroups::new())),
+            xdg_dirs,
         })
     }
 
     pub fn update_surfaces(&mut self, ev_handle: LoopHandle<Wpaperd>, qh: &QueueHandle<Wpaperd>) {
         for surface in &mut self.surfaces {
-            let res = self.config.get_output_by_name(&surface.name());
+            let res = self
+                .config
+                .get_info_for_output(surface.name(), surface.description());
             match res {
                 Ok(wallpaper_info) => {
-                    surface.update_wallpaper_info(&ev_handle, qh, wallpaper_info);
+                    surface.update_wallpaper_info(
+                        &ev_handle,
+                        qh,
+                        wallpaper_info,
+                        self.wallpaper_groups.clone(),
+                    );
                 }
                 Err(err) => warn!(
                     "Configuration error for display {}: {err:?}",
@@ -90,7 +106,7 @@ impl Wpaperd {
     pub fn surface_from_wl_surface(&mut self, surface: &wl_surface::WlSurface) -> &mut Surface {
         self.surfaces
             .iter_mut()
-            .find(|s| surface == &s.surface)
+            .find(|s| surface == s.wl_surface())
             .expect("surface to be registered in wpaperd")
     }
 }
@@ -116,12 +132,7 @@ impl CompositorHandler for Wpaperd {
     ) {
         let surface = self.surface_from_wl_surface(surface);
 
-        match surface.draw(qh, time) {
-            Ok(_) => {}
-            Err(err) => {
-                error!("Error drawing surface: {err:?}");
-            }
-        }
+        surface.try_drawing(qh, Some(time));
     }
 
     fn transform_changed(
@@ -133,6 +144,24 @@ impl CompositorHandler for Wpaperd {
     ) {
         self.surface_from_wl_surface(surface)
             .change_transform(new_transform, qh);
+    }
+
+    fn surface_enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
     }
 }
 
@@ -164,13 +193,18 @@ impl OutputHandler for Wpaperd {
             .as_ref()
             .map(|name| name.to_string())
             .unwrap_or_else(|| "unnamed".to_string());
+        let description = info
+            .description
+            .as_ref()
+            .map(|description| description.to_string())
+            .unwrap_or_else(|| "no-description".to_string());
         let display_info = DisplayInfo::new(info);
 
         let layer = self.layer_state.create_layer_surface(
             qh,
             surface.clone(),
             Layer::Background,
-            Some(format!("wpaperd-{}", name)),
+            Some(format!("wpaperd-{name}")),
             Some(&output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT | Anchor::BOTTOM);
@@ -194,31 +228,53 @@ impl OutputHandler for Wpaperd {
             }
 
             Err(_) => {
-                warn!("could not create region, cursor won't be shown for display {name}");
+                warn!("Failed to create region, cursor won't be shown for display {name}");
                 return;
             }
         };
 
-        let wallpaper_info = match self.config.get_output_by_name(&name) {
+        let wallpaper_info = match self.config.get_info_for_output(&name, &description) {
             Ok(wallpaper_info) => wallpaper_info,
             Err(err) => {
                 warn!(
-                    "Configuration error on display {}: {err:?}",
-                    name.bold().magenta()
+                    "{:?}",
+                    err.wrap_err(format!(
+                        "Configuration error on display {}",
+                        name.bold().magenta()
+                    ))
                 );
                 WallpaperInfo::default()
             }
         };
 
-        self.surfaces.push(Surface::new(
+        let xdg_state_home_dir = match self.xdg_dirs.create_state_directory("wallpapers") {
+            Ok(dir) => dir,
+            Err(err) => {
+                warn!(
+                    "{:?}",
+                    eyre!(err).wrap_err(format!(
+                        "Could not create wallpapers state directory for display {name}"
+                    ))
+                );
+                self.xdg_dirs.get_state_home()
+            }
+        };
+        let name = display_info.name.clone();
+        let res = Surface::new(
+            self,
             layer,
             output,
             display_info,
             wallpaper_info,
-            self.egl_display,
-            self.filelist_cache.clone(),
-            self.image_loader.clone(),
-        ));
+            xdg_state_home_dir,
+        );
+        match res {
+            Ok(surface) => self.surfaces.push(surface),
+            Err(err) => error!(
+                "{:?}",
+                err.wrap_err(format!("Failed to create surface for display {name}"))
+            ),
+        }
     }
 
     fn update_output(
@@ -242,12 +298,31 @@ impl OutputHandler for Wpaperd {
             .surfaces
             .iter()
             .enumerate()
-            .find(|(_, surface)| surface.output == output)
+            .find(|(_, surface)| *surface.wl_output() == output)
         {
             Some((index, _)) => {
                 self.surfaces.swap_remove(index);
             }
-            None => error!("could not find display while handling output_destroyed"),
+            None => {
+                // get name of display using xdg
+                let info = match self.output_state.info(&output) {
+                    Some(info) => info,
+                    None => {
+                        error!("Failed to remove display from wpaperd status");
+                        return;
+                    }
+                };
+
+                error!(
+                    "Failed to remove display {} from wpaperd status",
+                    info.name
+                        .map(|n| n.magenta().to_string())
+                        .unwrap_or_else(|| info
+                            .description
+                            .map(|d| d.blue().to_string())
+                            .unwrap_or("unnamed".red().to_string()))
+                );
+            }
         }
     }
 }
@@ -266,10 +341,12 @@ impl LayerShellHandler for Wpaperd {
         match self
             .surfaces
             .iter_mut()
-            .find(|surface| &surface.layer == layer)
+            .find(|surface| surface.layer() == layer)
         {
             Some(surface) => surface.change_size(configure, qh),
-            None => error!("could not find display while handling configure in wayland"),
+            None => error!(
+                "Failed to find display associated to the layer shell surface in wpaperd status"
+            ),
         }
     }
 }

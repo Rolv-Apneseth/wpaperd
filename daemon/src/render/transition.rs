@@ -1,9 +1,6 @@
 use std::ffi::CStr;
 
-use color_eyre::{
-    eyre::{bail, ensure},
-    Result,
-};
+use color_eyre::{eyre::ensure, Result};
 use serde::Deserialize;
 //use wpaperd_transitions_proc_macro::Transitions;
 
@@ -43,7 +40,6 @@ impl UniformSetter for bool {
 impl UniformSetter for i32 {
     unsafe fn set_uniform(&self, gl: &gl::Gl, loc: gl::types::GLint) {
         unsafe {
-            println!("{}", self);
             gl.Uniform1i(loc, *self);
         }
     }
@@ -66,7 +62,7 @@ impl UniformSetter for [i32; 2] {
 impl UniformSetter for [u32; 2] {
     unsafe fn set_uniform(&self, gl: &gl::Gl, loc: gl::types::GLint) {
         unsafe {
-            gl.Uniform2uiv(loc, 1, self.as_ptr());
+            gl.Uniform2iv(loc, 1, self.as_ptr() as *const _);
         }
     }
 }
@@ -98,7 +94,7 @@ impl UniformSetter for [f32; 4] {
 macro_rules! transition_shader {
     ($enum:ident { $($variant:ident { $($field_name:ident: $field_ty:ty = ($glsl_name:literal, $default_value:expr)),* } => $default_time:expr),* }) => {
         #[derive(Deserialize, Clone, Debug, PartialEq)]
-        #[serde(rename_all = "kebab-case", tag = "transition")]
+        #[serde(rename_all = "kebab-case", rename_all_fields = "kebab-case", deny_unknown_fields)]
         pub enum $enum {
             $($variant { $($field_name: Option<$field_ty>),* }),*
         }
@@ -116,10 +112,10 @@ macro_rules! transition_shader {
                             $(
                                 unsafe {
                                     let loc = gl.GetUniformLocation(program, format_bytes!(b"{}\0", $glsl_name.as_bytes()).as_ptr() as *const _);
-                                    gl_check!(gl, format!("getting the uniform location for {}", $glsl_name));
-                                    ensure!(loc >= 0, "uniform {} cannot be found", $glsl_name);
+                                    gl_check!(gl, format!("Failed to get the uniform location for parameter {}", $glsl_name));
+                                    ensure!(loc >= 0, "Uniform {} does not exist in the shader", $glsl_name);
                                     $field_name.unwrap_or($default_value).set_uniform(gl, loc);
-                                    gl_check!(gl, format!("calling Uniform on {}", $glsl_name));
+                                    gl_check!(gl, format!("Failed to set the value of the uniform {}", $glsl_name));
                                 }
                             )*
                             Ok(())
@@ -187,6 +183,11 @@ transition_shader! {
             frequency: f32 = ("frequency", 0.5),
             drip_scale: f32 = ("dripScale", 0.5)
         } => 2000,
+        Doorway {
+            reflection: f32 = ("reflection", 0.4),
+            perspective: f32 = ("perspective", 0.4),
+            depth: f32 = ("depth", 3.0)
+        } => 1500,
         Dreamy{} => 1500,
         DreamyZoom{
             rotation: f32 = ("rotation", 6.0),
@@ -205,7 +206,7 @@ transition_shader! {
             pause: f32 = ("pause", 0.1),
             divider_width: f32 = ("dividerWidth", 0.05),
             bgcolor: [f32; 4] = ("bgcolor", [0.0, 0.0, 0.0, 1.0]),
-           randomness: f32 = ("randomness", 0.1)
+            randomness: f32 = ("randomness", 0.1)
         } => 1500,
         Hexagonalize {
             steps: i32 = ("steps", 50),
@@ -244,6 +245,35 @@ transition_shader! {
             rotations: f32 = ("rotations", 1.0),
             scale: f32 = ("scale", 8.0),
             back_color: [f32; 4] = ("backColor", [0.15, 0.15, 0.15, 1.0])
-        } => 1500
+        } => 1500,
+        RotateScaleVanish {
+            fade_in_second: bool = ("FadeInSecond", true),
+            reverse_effect: bool = ("ReverseEffect", false),
+            reverse_rotation: bool = ("ReverseRotation", false)
+        } => 1500,
+        SimpleZoom {
+            zoom_quickness: f32 = ("zoom_quickness", 0.8)
+        } => 1500,
+        Slides {
+            slides_type: i32 = ("type", 0),
+            slides_in: bool = ("In", false)
+        } => 1500,
+        StaticFade {
+            n_noise_pixels: f32 = ("n_noise_pixels", 200.0),
+            static_luminosity: f32 = ("static_luminosity", 0.8)
+        } => 1500,
+        StereoViewer {
+            zoom: f32 = ("zoom", 0.88),
+            corner_radius: f32 = ("corner_radius", 0.22)
+        } => 2000,
+        Swirl {} => 1500,
+        TvStatic {
+            offset: f32 = ("offset", 0.05)
+        } => 1000,
+        WaterDrop {
+            amplitude: f32 = ("amplitude", 30.0),
+            speed: f32 = ("speed", 30.0)
+        } => 1500,
+        WindowBlinds {} => 1500
     }
 }

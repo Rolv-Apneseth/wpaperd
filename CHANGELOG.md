@@ -1,6 +1,56 @@
-# 1.1
+# 1.2.2
+## Breaking changes
+- `initial-transition` is now set to false by default
+## Bugfixes
+- Fix leak by reusing memory for loading wallpapers (fixes #131).
+- Fix binding previous wallpaper to properly show transitions.
+- Disable vsync to let the event loop handle the transitions.
+- Do not create empty config directory (`$XDG_CONFIG_HOME/wpaperd`) (#132).
 
+# 1.2.1
+## Bux fixes
+- Load `exec` value from default (fixes #123).
+
+# 1.2.0
+## New features
+- Add a new `recursive` config option, enabled by default (fixes #112).
+- Add support for regex (thanks to [@ein-shived](https://github.com/ein-shved), #108)
+- Add support for running scripts every time the wallpaper change (thanks to [@Primitheus](https://github.com/Primitheus), #121)
+## Bug fixes
+- Redraw wallpaper when the screen rotates
+- Skip the transition when it's happening in background
+  (i.e. the wallpaper is not currently focused).
+
+# 1.1.1
+## New features
+- Make jemalloc feature optional, enabled by default
+
+## Bug fixes
+- Fix build on non x86_64 architectures
+
+# 1.1.0
+
+## Breaking changes
+- Rename `transition_time` and `queue_size` to kebab case (`transition-time` and `queue-size`).
+
+## New features
 - Add `avif` feature to load `avif` images (requires `dav1d` library)
+- Add `offset` configuration to move the wallpaper from the center of the screen
+- Add `fit-border-color` background mode, which works like `fit` but uses the color of the
+  border of the image to fill the rest of the screen not covered
+- Add `initial-transition` configuration to disable the startup transition if needed
+- Add `group` configuration to share the same wallpaper between multiple displays
+- Match displays using their name or their description (fixes #90)
+- Add multiple transition styles from [gl-transition]
+- Add a link to the current wallpaper in `.local/state/wpaperd/wallpapers` for each display
+- Listen to SIGINT, SIGTERM and SIGHUP signals and do a graceful exit
+
+## Other changes
+- Reworked the timer handling
+- Reworked wallpaper loading to be lighter
+- Many bug fixes and small changes on its behavior
+
+[gl-transition]: https://gl-transitions.com/
 
 # 1.0.1
 

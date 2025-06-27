@@ -6,6 +6,7 @@ use smithay_client_toolkit::{
 #[derive(Debug)]
 pub struct DisplayInfo {
     pub name: String,
+    pub description: String,
     pub width: i32,
     pub height: i32,
     pub scale: i32,
@@ -16,21 +17,12 @@ impl DisplayInfo {
     pub fn new(info: OutputInfo) -> Self {
         Self {
             name: info.name.unwrap_or_default(),
+            description: info.description.unwrap_or_default(),
             width: 0,
             height: 0,
             scale: info.scale_factor,
             transform: info.transform,
         }
-    }
-
-    #[inline]
-    pub fn scaled_width(&self) -> i32 {
-        self.width * self.scale
-    }
-
-    #[inline]
-    pub fn scaled_height(&self) -> i32 {
-        self.height * self.scale
     }
 
     #[inline]
@@ -60,16 +52,19 @@ impl DisplayInfo {
     }
 
     #[inline]
-    pub fn ratio(&self) -> f32 {
-        self.adjusted_width() as f32 / self.adjusted_height() as f32
+    pub fn scaled_width(&self) -> i32 {
+        self.width * self.scale
     }
 
     #[inline]
-    pub fn aspect(&self) -> f32 {
-        // adjusted_width and adjusted_height returns the rotated sizes in case
-        // the display is rotated. However, openGL is drawing in the same orientation
-        // as our display (i.e. we don't apply any transform here)
-        self.adjusted_height() as f32 / self.adjusted_width() as f32
+    pub fn scaled_height(&self) -> i32 {
+        self.height * self.scale
+    }
+
+    #[inline]
+    #[allow(unused)]
+    pub fn ratio(&self) -> f32 {
+        self.adjusted_width() as f32 / self.adjusted_height() as f32
     }
 
     pub fn change_size(&mut self, configure: LayerSurfaceConfigure) -> bool {
@@ -100,5 +95,9 @@ impl DisplayInfo {
         } else {
             false
         }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.width != 0 && self.height != 0
     }
 }

@@ -1,74 +1,102 @@
-use std::{cell::RefCell, ffi::CStr, rc::Rc};
+use std::{ffi::CStr, rc::Rc};
 
-use color_eyre::{
-    eyre::{bail, ensure},
-    Result,
-};
+use color_eyre::Result;
 use image::DynamicImage;
+use log::warn;
 
-use crate::{display_info::DisplayInfo, gl_check, render::gl};
+use crate::{gl_check, render::gl};
 
-use super::{coordinates::Coordinates, load_texture};
+use super::load_texture;
 
 pub struct Wallpaper {
-    pub texture: gl::types::GLuint,
-    pub image_width: u32,
-    pub image_height: u32,
-    display_info: Rc<RefCell<DisplayInfo>>, // transparent_texture: gl::types::GLuint,
+    gl: Rc<gl::Gl>,
+    texture: gl::types::GLuint,
+    image_width: u32,
+    image_height: u32,
 }
 
 impl Wallpaper {
-    pub const fn new(display_info: Rc<RefCell<DisplayInfo>>) -> Self {
-        Self {
-            texture: 0,
-            image_width: 10,
-            image_height: 10,
-            display_info,
+    pub fn new(gl: Rc<gl::Gl>, image: DynamicImage, current: bool) -> Result<Self> {
+        let image_width = image.width();
+        let image_height = image.height();
+        let mut texture = 0;
+        unsafe {
+            gl.GenTextures(1, &mut texture);
+            gl.ActiveTexture(if current { gl::TEXTURE1 } else { gl::TEXTURE0 });
+            gl_check!(
+                gl,
+                format!(
+                    "Failed to activate the texture TEXTURE{}",
+                    if current { 1 } else { 0 }
+                )
+            );
+            gl.BindTexture(gl::TEXTURE_2D, texture);
+            gl_check!(
+                gl,
+                format!(
+                    "Failed to bind the texture TEXTURE{}",
+                    if current { 1 } else { 0 }
+                )
+            );
         }
+        load_texture(&gl, image)?;
+
+        Ok(Self {
+            gl,
+            texture,
+            image_width,
+            image_height,
+        })
     }
 
-    pub fn bind(&self, gl: &gl::Gl) -> Result<()> {
+    pub fn bind(&self) -> Result<()> {
         unsafe {
-            gl.BindTexture(gl::TEXTURE_2D, self.texture);
-            gl_check!(gl, "binding textures");
+            self.gl.BindTexture(gl::TEXTURE_2D, self.texture);
+            gl_check!(self.gl, "Failed to bind the texture");
         }
 
         Ok(())
     }
 
-    pub fn load_image(&mut self, gl: &gl::Gl, image: DynamicImage) -> Result<()> {
+    pub fn get_image_height(&self) -> u32 {
+        self.image_height
+    }
+
+    pub fn get_image_width(&self) -> u32 {
+        self.image_width
+    }
+
+    pub fn load_image(&mut self, image: DynamicImage, current: bool) -> Result<()> {
         self.image_width = image.width();
         self.image_height = image.height();
 
-        let texture = load_texture(gl, image)?;
-
         unsafe {
-            // Delete from memory the previous texture
-            gl.DeleteTextures(1, &self.texture);
+            self.gl
+                .ActiveTexture(if current { gl::TEXTURE1 } else { gl::TEXTURE0 });
+            gl_check!(
+                self.gl,
+                format!(
+                    "Failed to activate the texture TEXTURE{}",
+                    if current { 1 } else { 0 }
+                )
+            );
+            self.bind()?;
         }
-        self.texture = texture;
-
-        Ok(())
+        load_texture(&self.gl, image)
     }
+}
 
-    pub fn generate_vertices_coordinates_for_fit_mode(&self) -> Coordinates {
-        let display_width = self.display_info.borrow().scaled_width();
-        let display_height = self.display_info.borrow().scaled_height();
-        let display_ratio = display_width as f32 / display_height as f32;
-        let image_ratio = self.image_width as f32 / self.image_height as f32;
-        if display_ratio == image_ratio {
-            Coordinates::default_vec_coordinates()
-        } else if display_ratio > image_ratio {
-            let x = image_ratio / display_ratio;
-            Coordinates::new(-x, x, Coordinates::VEC_Y_BOTTOM, Coordinates::VEC_Y_TOP)
-        } else {
-            let y = 1.0 - display_ratio / image_ratio;
-            Coordinates::new(
-                Coordinates::VEC_X_LEFT,
-                Coordinates::VEC_X_RIGHT,
-                Coordinates::VEC_Y_BOTTOM - y,
-                Coordinates::VEC_Y_TOP + y,
-            )
+impl Drop for Wallpaper {
+    fn drop(&mut self) {
+        unsafe { self.gl.DeleteTextures(1, &self.texture) };
+        let check_err = || -> Result<()> {
+            unsafe {
+                gl_check!(self.gl, "Failed to delete the previous texture");
+            }
+            Ok(())
+        };
+        if let Err(err) = check_err() {
+            warn!("{:?}", err.wrap_err("Failed to drop the wallpaper"));
         }
     }
 }
