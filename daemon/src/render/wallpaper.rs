@@ -25,18 +25,12 @@ impl Wallpaper {
             gl.ActiveTexture(if current { gl::TEXTURE1 } else { gl::TEXTURE0 });
             gl_check!(
                 gl,
-                format!(
-                    "Failed to activate the texture TEXTURE{}",
-                    if current { 1 } else { 0 }
-                )
+                format!("Failed to activate the texture TEXTURE{}", current as u8)
             );
             gl.BindTexture(gl::TEXTURE_2D, texture);
             gl_check!(
                 gl,
-                format!(
-                    "Failed to bind the texture TEXTURE{}",
-                    if current { 1 } else { 0 }
-                )
+                format!("Failed to bind the texture TEXTURE{}", current as u8)
             );
         }
         load_texture(&gl, image)?;
@@ -75,10 +69,7 @@ impl Wallpaper {
                 .ActiveTexture(if current { gl::TEXTURE1 } else { gl::TEXTURE0 });
             gl_check!(
                 self.gl,
-                format!(
-                    "Failed to activate the texture TEXTURE{}",
-                    if current { 1 } else { 0 }
-                )
+                format!("Failed to activate the texture TEXTURE{}", current as u8)
             );
             self.bind()?;
         }
