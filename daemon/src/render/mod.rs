@@ -5,7 +5,10 @@ mod shader;
 mod transition;
 mod wallpaper;
 
-use std::ffi::{c_void, CStr};
+use std::{
+    ffi::{c_void, CStr},
+    io::Read,
+};
 
 use color_eyre::Result;
 use coordinates::{get_opengl_point_coordinates, Coordinates};
@@ -137,7 +140,7 @@ fn load_texture(gl: &gl::Gl, image: DynamicImage) -> Result<()> {
             0,
             gl::RGBA,
             gl::UNSIGNED_BYTE,
-            image.as_bytes().as_ptr() as *const c_void,
+            image.into_rgba8().as_ptr() as *const c_void,
         );
         gl_check!(gl, "Failed to pass the image data to the texture");
         gl.GenerateMipmap(gl::TEXTURE_2D);

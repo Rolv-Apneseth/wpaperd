@@ -262,7 +262,7 @@ impl Surface {
                 self.context
                     .as_mut()
                     .ok_or_else(|| eyre!("EGL context is not available"))?
-                    .load_wallpaper(data.into(), background_mode, offset, &self.display_info)?;
+                    .load_wallpaper(data, background_mode, offset, &self.display_info)?;
 
                 if self.image_picker.is_reloading() {
                     self.image_picker.reloaded();

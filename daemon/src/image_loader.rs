@@ -1,17 +1,15 @@
 use std::{
     collections::HashMap,
-    fs::File,
-    io::BufReader,
     path::PathBuf,
     sync::mpsc::{Receiver, TryRecvError},
 };
 
 use color_eyre::eyre::eyre;
-use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
+use image::{DynamicImage, ImageDecoder, ImageReader};
 use log::warn;
 use smithay_client_toolkit::reexports::calloop::ping::Ping;
 
-type ImageData = Option<RgbaImage>;
+type ImageData = Option<DynamicImage>;
 
 struct Image {
     data: ImageData,
@@ -20,7 +18,7 @@ struct Image {
 }
 
 pub enum ImageLoaderStatus {
-    Loaded(RgbaImage),
+    Loaded(DynamicImage),
     Waiting,
     Error,
 }
@@ -95,9 +93,7 @@ impl ImageLoader {
         let requester_clone = requester_name.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         rayon::spawn(move || {
-            match File::open(&path_clone)
-                .and_then(|file| ImageReader::new(BufReader::new(file)).with_guessed_format())
-            {
+            match ImageReader::open(&path_clone).and_then(ImageReader::with_guessed_format) {
                 Ok(image) => {
                     // Notify the event loop that the image has been loaded
                     // We need this so that Surface::load_wallpaper is called even if
@@ -107,10 +103,11 @@ impl ImageLoader {
                     // condition
                     let mut decoder = image.into_decoder().unwrap();
                     let orientation = decoder.orientation().unwrap();
+
                     let mut image = DynamicImage::from_decoder(decoder).unwrap();
                     image.apply_orientation(orientation);
-                    let image = image.into_rgba8();
                     tx.send(Some(image)).unwrap();
+
                     ping_clone.ping();
                 }
                 Err(err) => {
